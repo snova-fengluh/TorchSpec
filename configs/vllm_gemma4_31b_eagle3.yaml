@@ -1,0 +1,119 @@
+# TorchSpec online Eagle3 training config.
+#
+# Ported from a speculators run:
+#   scripts/train.py --verifier-name-or-path google/gemma-4-31B-it \
+#     --data-path .../kimi-mtp-dataset --vllm-endpoint http://localhost:8000/v1 \
+#     --save-path ../checkpoints/gemma4_draft_model_300k_eagle3 --epochs 3 --lr 1e-4 \
+#     --total-seq-len 8192 --on-missing generate --on-generate delete \
+#     --logger wandb --run-name gemma4_draft_300k_eagle3
+#
+# In speculators, hidden states were generated on the fly by a *separate* vLLM
+# server (on-missing=generate, on-generate=delete). Here TorchSpec launches and
+# manages its own vLLM engine and streams aux hidden states via Mooncake, so
+# there is no external --vllm-endpoint. This is native online training.
+#
+# Usage:
+#   python -m torchspec.train_entry --config configs/vllm_gemma4_31b_eagle3.yaml
+#
+# BEFORE RUNNING, resolve the two blockers noted below (dataset + Gemma support).
+
+model:
+  target_model_path: google/gemma-4-31B-it   # verifier-name-or-path
+  # gemma-4 is a Gemma4ForConditionalGeneration (multimodal wrapper) with a
+  # nested text_config; it needs trust_remote_code and the weight keys below.
+  trust_remote_code: true
+  draft_model_config: configs/draft_models/gemma4_31b_eagle3.json
+  # Gemma ties word embeddings (tie_word_embeddings=true) -> there is NO separate
+  # lm_head.weight tensor, so lm_head_key points at the embedding tensor.
+  # The multimodal wrapper nests the text weights under language_model.*; adjust
+  # these prefixes to match the actual safetensors keys in the checkpoint.
+  embedding_key: language_model.model.embed_tokens.weight
+  lm_head_key: language_model.model.embed_tokens.weight
+  norm_key: language_model.model.norm.weight
+  target_model_backend: vllm
+
+dataset:
+  # BLOCKER 1: speculators consumed a pre-tokenized HF Arrow dataset
+  # (kimi-mtp-dataset: input_ids + loss_mask). TorchSpec online (default,
+  # prefill-only mode) expects raw JSONL conversations that already contain the
+  # ASSISTANT completions -- it teacher-forces over the full sequence to extract
+  # target hidden states (it does NOT generate completions unless
+  # training.train_with_decode=true). Re-export the source conversations,
+  # including the Gemma-4 completions, to JSONL:
+  #   {"id": ..., "conversations": [{"role":"user",...},{"role":"assistant",...}]}
+  train_data_path: /sms-scratch/ravira/datasets/kimi-mtp-dataset.jsonl
+  # "gemma4" template registered in torchspec/data/template.py. GeneralParser
+  # formats via the tokenizer's own apply_chat_template; the template's headers
+  # drive loss-mask matching. Verify the special-token strings against the real
+  # tokenizer, and switch to a thinking-style variant if the data uses the
+  # <|channel>thought...<channel|> reasoning channel.
+  chat_template: gemma4
+  prompt_key: conversations
+  last_turn_loss_only: auto        # supervise assistant turns (as speculators did)
+  shuffle_dataset: true
+
+training:
+  attention_backend: flex_attention   # ~ draft_attn_impl=simple_flex_attention
+  micro_batch_size: 1                 # tune to fit memory (speculators packed by seq-len)
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4                 # lr
+  weight_decay: 0.01                  # weight_decay (optimizer=adamw; Muon params unused)
+  max_grad_norm: 0.5
+  lr_decay_style: linear              # scheduler_type=linear
+  warmup_ratio: 0.0                   # speculators had no warmup steps configured
+  min_lr: 0.0
+  max_seq_length: 8192                # total_seq_len
+  num_epochs: 3                       # epochs
+  ttt_length: 3                       # ttt_steps=3 (TorchSpec default is 7)
+  # ttt_step_loss_decay=1.0 => no decay. TorchSpec default is [0.8**i]; override:
+  ploss_weights: [1.0, 1.0, 1.0]
+  seed: 42                            # seed
+  save_per_epoch: true               # ~ checkpoint_freq=1 epoch
+  # Multi-GPU training group (31B target needs several GPUs total). Adjust:
+  training_num_gpus_per_node: 2
+  training_num_nodes: 1
+
+inference:
+  inference_engine_type: vllm         # colleague used a vLLM endpoint
+  inference_num_gpus: 4               # 31B target: raise TP/GPUs as needed
+  inference_num_gpus_per_engine: 4
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  # target_layer_ids was null in speculators -> it auto-picked [2, N//2, N-3].
+  # gemma-4-31B has num_hidden_layers=60, so speculators used [2, 30, 57].
+  # Set explicitly here to align (TorchSpec's own default would be [1, 29, 56]).
+  aux_hidden_states_layers: [2, 30, 57]
+  vllm:
+    tp_size: 4
+    mem_fraction_static: 0.7
+    extra_args:
+      max_model_len: 8192
+
+logging:
+  report_to: wandb                          # logger=wandb
+  wandb_team: ravi-raju0594-personal              # wandb entity == the workspace owner
+  wandb_project: torchspec-eagle3           # project (workspace) name
+  # Run name is taken from wandb_group (falls back to wandb_project). Set the
+  # group + disable the random suffix to get an exact run name (== run-name arg).
+  wandb_group: gemma4_draft_50k_eagle3
+  wandb_random_suffix: false
+  # Auth: prefer `wandb login` / WANDB_API_KEY env. Uncomment to pass inline:
+  # wandb_key: YOUR_WANDB_API_KEY
+  # Only for self-hosted / dedicated-cloud wandb:
+  # wandb_host: https://your-wandb-host
+  # wandb_mode: online                       # online | offline | disabled
+  # wandb_dir: ./wandb
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 32GB
+  local_buffer_size: 4GB
+  max_seq_len: 8192
+
+output_dir: ./checkpoints/gemma4_draft_model_300k_eagle3   # save_path
+cache_dir: ./cache/gemma4_draft_300k_eagle3
+model_download_dir: null

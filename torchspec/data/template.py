@@ -276,3 +276,23 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|user|>",
     ),
 )
+
+# Gemma-4 canonical chat template. GeneralParser formats via the tokenizer's own
+# apply_chat_template; these headers are only used to (a) build the loss-mask
+# regex over the formatted text and (b) match assistant token subsequences for
+# the dynamic loss mask. They must therefore be exact substrings of the Gemma-4
+# Jinja output. For a plain [user, assistant] turn Gemma-4 emits:
+#   <bos><|turn>user\n{user}<turn|>\n<|turn>model\n{assistant}<turn|>\n
+# (assistant role is rendered as "model"). Gemma has no default system prompt.
+# NOTE: verify the special-token strings (<|turn>, <turn|>) against the real
+# tokenizer; if the model was trained with the <|channel>thought...<channel|>
+# reasoning channel, use a thinking-style variant instead.
+TEMPLATE_REGISTRY.register(
+    name="gemma4",
+    template=ChatTemplate(
+        assistant_header="<|turn>model\n",
+        user_header="<|turn>user\n",
+        system_prompt=None,
+        end_of_turn_token="<turn|>\n",
+    ),
+)
