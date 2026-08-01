@@ -277,6 +277,28 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# Kimi-K3 uses an XTML-style chat format (not role headers). Each message is
+# <|open|>{tag} {attrs}<|sep|>...<|close|>{tag}<|sep|> terminated by
+# <|end_of_msg|>, and assistant turns carry <think>/<response> channels. These
+# headers are the exact substrings the KimiK3Parser emits: user_header opens a
+# user message, assistant_header is the prefix up to where generation begins
+# (message->think channel), and end_of_turn_token is the per-message terminator
+# (also the eos id 163586). See torchspec/data/parse.py::KimiK3Parser, built from
+# the shipped tokenizer (tokenization_kimi.py / encoding_k3.py). K3 has no
+# default system prompt.
+TEMPLATE_REGISTRY.register(
+    name="kimi-k3",
+    template=ChatTemplate(
+        assistant_header='<|open|>message role="assistant"<|sep|><|open|>think<|sep|>',
+        user_header='<|open|>message role="user"<|sep|>',
+        system_prompt=None,
+        end_of_turn_token="<|end_of_msg|>",
+        parser_type="kimi-k3",
+        enable_thinking=True,
+        image_placeholder="<|kimi_image_placeholder|>",
+    ),
+)
+
 # Gemma-4 canonical chat template. GeneralParser formats via the tokenizer's own
 # apply_chat_template; these headers are only used to (a) build the loss-mask
 # regex over the formatted text and (b) match assistant token subsequences for

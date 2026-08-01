@@ -115,5 +115,5 @@ mooncake:
   max_seq_len: 8192
 
 output_dir: ./checkpoints/gemma4_draft_model_300k_eagle3   # save_path
-cache_dir: ./cache/gemma4_draft_300k_eagle3
+cache_dir: ./cache/gemma4_draft_50k_eagle3
 model_download_dir: null

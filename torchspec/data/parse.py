@@ -38,6 +38,7 @@ __all__ = [
     "GeneralParser",
     "HarmonyParser",
     "KimiK25Parser",
+    "KimiK3Parser",
     "MiniMaxParser",
     "create_parser",
     "has_thinking_content",
@@ -700,6 +701,223 @@ class MiniMaxParser(Parser):
         )
 
 
+class KimiK3Parser(Parser):
+    """Parser for Kimi-K3 (kimi_linear text tower) XTML chat format.
+
+    Unlike role-header formats, K3 renders each message from four structural
+    markers::
+
+        <|open|>{tag} {k}="{v}"...<|sep|> ... <|close|>{tag}<|sep|>
+
+    and terminates every message with ``<|end_of_msg|>`` (also the eos id
+    163586). Assistant turns carry two nested channels, ``<think>`` (reasoning)
+    and ``<response>`` (answer). This mirrors the shipped tokenizer's
+    ``build_chat_segments`` (encoding_k3.py); the ``<|open|>/<|close|>/<|sep|>``
+    markers are real vocab tokens, so the formatted string tokenizes to the same
+    ids the model was trained on.
+
+    Handles:
+    - system / user / assistant / tool roles as XTML messages
+    - the think/response channel split, sourcing reasoning from a
+      reasoning_content/reasoning field or an inline ``<think>...</think>`` block
+    - dropping stale reasoning from non-final assistant turns (the think channel
+      is still emitted, matching the target renderer)
+    - assistant ``tool_calls`` rendered as argument tags
+    - loss mask over assistant-generated tokens (think + response + tool calls)
+    """
+
+    OPEN = "<|open|>"
+    CLOSE = "<|close|>"
+    SEP = "<|sep|>"
+    END_TOKEN = "<|end_of_msg|>"
+    IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
+
+    THINK_PATTERN = re.compile(r"<think>([\s\S]*?)</think>")
+    _REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking", "thinking_content")
+
+    def __init__(self, tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate):
+        super().__init__(tokenizer, chat_template)
+        if chat_template.image_placeholder:
+            self.IMAGE_PLACEHOLDER = chat_template.image_placeholder
+        self.assistant_msg_open = self._open_tag("message", [("role", "assistant")])
+        self.think_open = self._open_tag("think")
+        self.response_open = self._open_tag("response")
+        # Loss-mask anchor: assistant generation begins right after the think
+        # channel opens inside the assistant message.
+        self.ASSISTANT_HEADER = self.assistant_msg_open + self.think_open
+
+    # ── XTML helpers (mirror encoding_k3.py) ──────────────────────────────
+    @staticmethod
+    def _escape_attr(value) -> str:
+        return str(value).replace("&", "&amp;").replace('"', "&quot;")
+
+    def _open_tag(self, tag: str, attrs=()) -> str:
+        parts = [self.OPEN, tag]
+        for key, value in attrs:
+            parts.append(f' {key}="{self._escape_attr(value)}"')
+        parts.append(self.SEP)
+        return "".join(parts)
+
+    def _close_tag(self, tag: str) -> str:
+        return f"{self.CLOSE}{tag}{self.SEP}"
+
+    @staticmethod
+    def _xtml_type(value) -> str:
+        if isinstance(value, bool):
+            return "boolean"
+        if value is None:
+            return "null"
+        if isinstance(value, (int, float)):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, dict):
+            return "object"
+        return "array"
+
+    @staticmethod
+    def _xtml_value(value) -> str:
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False)
+
+    def _render_content(self, content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if item.get("type") in ("image", "image_url"):
+                    parts.append(self.IMAGE_PLACEHOLDER)
+                else:
+                    parts.append(item.get("text", ""))
+            return "".join(parts)
+        return "" if content is None else str(content)
+
+    def _extract_reasoning(self, msg: dict, content: str) -> Tuple[str, str]:
+        """Return (reasoning, response_content), sourcing thinking from an
+        explicit field or an inline <think>...</think> block."""
+        for field in self._REASONING_FIELDS:
+            if msg.get(field):
+                return str(msg[field]), content
+        match = self.THINK_PATTERN.search(content)
+        if match:
+            reasoning = match.group(1)
+            remaining = self.THINK_PATTERN.sub("", content, count=1)
+            return reasoning, remaining
+        return "", content
+
+    def _render_tool_calls(self, tool_calls: list) -> str:
+        out = [self._open_tag("tools")]
+        for index, tool_call in enumerate(tool_calls, start=1):
+            fn = tool_call.get("function", tool_call)
+            out.append(self._open_tag("call", [("tool", fn.get("name", "")), ("index", index)]))
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, ValueError):
+                    args = None
+            if isinstance(args, dict):
+                for key, value in args.items():
+                    out.append(
+                        self._open_tag(
+                            "argument", [("key", key), ("type", self._xtml_type(value))]
+                        )
+                    )
+                    out.append(self._xtml_value(value))
+                    out.append(self._close_tag("argument"))
+            out.append(self._close_tag("call"))
+        out.append(self._close_tag("tools"))
+        return "".join(out)
+
+    def _render_assistant(self, msg: dict, include_reasoning: bool) -> str:
+        content = self._render_content(msg.get("content", ""))
+        reasoning, content = self._extract_reasoning(msg, content)
+        if not include_reasoning:
+            reasoning = ""
+
+        out = [self.think_open]
+        if reasoning and reasoning.strip():
+            out.append(reasoning)
+        out.append(self._close_tag("think"))
+        out.append(self.response_open)
+        out.append(content)
+        out.append(self._close_tag("response"))
+
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            out.append(self._render_tool_calls(tool_calls))
+        return "".join(out)
+
+    def format(self, conversation: "Conversation", **kwargs) -> str:
+        add_generation_prompt = kwargs.pop("add_generation_prompt", False)
+        parts = []
+
+        last_assistant_idx = max(
+            (i for i, m in enumerate(conversation) if m.get("role") == "assistant"),
+            default=-1,
+        )
+        tool_index = 0
+
+        for idx, msg in enumerate(conversation):
+            role = msg["role"]
+            if role in ("user", "system"):
+                attrs = [("role", role)]
+                if msg.get("name"):
+                    attrs.append(("name", msg["name"]))
+                parts.append(self._open_tag("message", attrs))
+                parts.append(self._render_content(msg.get("content", "")))
+                parts.append(self._close_tag("message"))
+                parts.append(self.END_TOKEN)
+            elif role == "assistant":
+                tool_index = 0
+                attrs = [("role", "assistant")]
+                if msg.get("name"):
+                    attrs.append(("name", msg["name"]))
+                parts.append(self._open_tag("message", attrs))
+                parts.append(
+                    self._render_assistant(msg, include_reasoning=(idx == last_assistant_idx))
+                )
+                parts.append(self._close_tag("message"))
+                parts.append(self.END_TOKEN)
+            elif role == "tool":
+                tool_index += 1
+                tool_name = msg.get("tool", msg.get("name", ""))
+                attrs = [("role", "tool"), ("tool", tool_name), ("index", tool_index)]
+                parts.append(self._open_tag("message", attrs))
+                parts.append(self._render_content(msg.get("content", "")))
+                parts.append(self._close_tag("message"))
+                parts.append(self.END_TOKEN)
+
+        if add_generation_prompt:
+            parts.append(self.assistant_msg_open)
+            parts.append(self.think_open)
+
+        return "".join(parts)
+
+    def parse(
+        self,
+        conversation: "Conversation",
+        max_length: int,
+        preformatted: bool = False,
+        last_turn_only: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        text = self._prepare_text(conversation, preformatted, **kwargs)
+        self._ensure_pad_token()
+
+        assistant_pattern = (
+            re.escape(self.ASSISTANT_HEADER) + r"([\s\S]*?)" + re.escape(self.END_TOKEN)
+        )
+        return self._tokenize_with_loss_mask(
+            text,
+            max_length,
+            assistant_pattern,
+            last_turn_only=last_turn_only,
+        )
+
+
 def create_parser(tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate) -> Parser:
     """Create the appropriate parser based on chat_template.parser_type."""
     if chat_template.parser_type == "general":
@@ -710,6 +928,8 @@ def create_parser(tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate) -
         return HarmonyParser(tokenizer, chat_template)
     elif chat_template.parser_type == "kimi-k25":
         return KimiK25Parser(tokenizer, chat_template)
+    elif chat_template.parser_type == "kimi-k3":
+        return KimiK3Parser(tokenizer, chat_template)
     elif chat_template.parser_type == "minimax-m2":
         return MiniMaxParser(tokenizer, chat_template)
     else:

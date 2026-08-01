@@ -1,0 +1,139 @@
+# Kimi-K3 MXFP4 Eagle3 training — 3-node setup (B200)
+#
+# Kimi-K3 (moonshotai/Kimi-K3) is a 2.8T-param (104B active) multimodal MoE with
+# a KimiK3ForConditionalGeneration wrapper over a KimiLinearForCausalLM text
+# tower (model_type=kimi_linear): a HYBRID of Kimi Delta Attention (KDA, linear)
+# on 69 layers and MLA on 24 full-attention layers. It is NOT a drop-in clone of
+# Kimi-K2.5 — the chat format, weight-key prefixes and eos/pad ids all differ.
+#
+# QUANTIZATION: the shipped HF checkpoint is ALREADY MXFP4 — config.json carries a
+# compressed-tensors quantization_config with format=mxfp4-pack-quantized
+# (num_bits=4, group_size=32). Only the routed MoE experts are 4-bit; self_attn,
+# shared_experts, the dense MLP (gate/up/down), lm_head and the vision tower stay
+# bf16 (see the quantization_config.ignore regexes). There is NO 8-bit->MXFP4
+# requantization step: vLLM auto-detects compressed-tensors from the checkpoint.
+#
+# Node layout (3 nodes x 8 B200 = 24 GPUs):
+#   - 2 nodes (16 GPUs) for inference via vLLM, TP=16, native MXFP4 weights
+#   - 1 node  (8  GPUs) for training the draft (FSDP/DP)
+#
+# WHY 3 nodes: at the native MXFP4 footprint the target fits on 2 inference nodes
+# (TP=16) with KV/activation headroom, and the draft trains on the 3rd node.
+# (Re-verify the exact on-GPU size for your build before assuming 2 nodes suffice.)
+#
+# Usage:
+#   python -m torchspec.train_entry --config configs/vllm_kimi_k3_3node.yaml
+#
+# BEFORE RUNNING, resolve the remaining BLOCKER flagged below (engine support).
+
+model:
+  target_model_path: moonshotai/Kimi-K3
+  trust_remote_code: true                 # custom KimiK3/KimiLinear modeling code
+  draft_model_config: configs/draft_models/kimi_k3_eagle3_mla.json
+  # Weight keys VERIFIED against K3's model.safetensors.index.json: the text tower
+  # is nested under the language_model.* prefix (embed_tokens/norm under
+  # language_model.model.*, lm_head under language_model.*). These match.
+  embedding_key: language_model.model.embed_tokens.weight
+  lm_head_key: language_model.lm_head.weight
+  norm_key: language_model.model.norm.weight
+  target_model_backend: vllm
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  eval_data_path: ../examples/data/eval_conversations.jsonl
+  # Chat template + parser IMPLEMENTED. K3 uses a tiktoken-based XTML format (not
+  # K2.5's <|im_*|> headers, and NOT the [start_header_id]/[EOT] tokens we first
+  # assumed): each message is <|open|>{tag} {attrs}<|sep|>...<|close|>{tag}<|sep|>
+  # terminated by <|end_of_msg|>, with assistant turns split into <think>/<response>
+  # channels (reasoning_content). The "kimi-k3" ChatTemplate + KimiK3Parser in
+  # torchspec/data/template.py + torchspec/data/parse.py mirror the shipped
+  # tokenizer (tokenization_kimi.py / encoding_k3.py).
+  chat_template: kimi-k3
+  defer_tokenization: true
+
+training:
+  max_seq_length: 20000
+  seed: 42
+  micro_batch_size: 1
+  num_epochs: 3
+  save_interval: 5000
+  learning_rate: 5e-5
+  warmup_ratio: 0.015
+  max_grad_norm: 1
+  ttt_length: 4
+  draft_accumulation_steps: 1
+  training_num_nodes: 1
+  training_num_gpus_per_node: 8
+  attention_backend: flex_attention
+  max_concurrent_batches: 1
+  gradient_checkpointing: true
+  distributed_timeout_minutes: 30
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 16
+  inference_num_gpus_per_engine: 16
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 32
+  inference_buffer_threshold: 8
+  inference_fetch_batch: 32
+  inference_batch_size: 4
+  # Aux layers VERIFIED: K3 has 93 layers; [4, 48, 88] are all FULL-ATTENTION (MLA)
+  # layers (config.json linear_attn_config.full_attn_layers = [4,8,...,88,92,93]),
+  # not KDA linear-attention layers, and pick early/mid/late depth. These match
+  # eagle_config.eagle_aux_hidden_state_layer_ids in kimi_k3_eagle3_mla.json. Tune
+  # as needed, but keep to full_attn_layers.
+  aux_hidden_states_layers: [4, 48, 88]
+  vllm:
+    tp_size: 16
+    nnodes: 2
+    dist_init_addr: null            # auto-negotiated via Ray
+    # Native MXFP4 weights (~1.45 TB) across 16 B200 leaves headroom; raise
+    # cautiously. Re-verify the exact on-GPU size for your build.
+    mem_fraction_static: 0.85
+    enable_multimodal: true
+    init_timeout: 1800
+    dist_timeout: 600
+    extra_args:
+      # QUANTIZATION VERIFIED: the shipped checkpoint is ALREADY MXFP4-packed
+      # (config.json quantization_config: quant_method=compressed-tensors,
+      # format=mxfp4-pack-quantized, num_bits=4, group_size=32; only routed MoE
+      # experts are 4-bit, self_attn/shared_experts/dense-MLP/lm_head/vision stay
+      # bf16 per the ignore regexes). vLLM AUTO-DETECTS compressed-tensors from the
+      # checkpoint — do NOT pass an explicit `quantization:` arg (setting it to a
+      # different scheme would override the on-disk format and fail to load). There
+      # is no separate 8-bit->MXFP4 requantization step.
+      max_model_len: 20000
+      trust_remote_code: true
+      # BLOCKER 5 (engine support): verify TorchSpec's VllmEngine +
+      # extract_hidden_states / MooncakeHiddenStatesConnector can load the custom
+      # KimiK3ForConditionalGeneration and extract aux hidden states from the
+      # KDA/MLA hybrid. vLLM upstream has a K3 recipe, but the TorchSpec wrapper
+      # path is unverified.
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  hidden_dim: 7168
+  global_segment_size: 96GB
+  local_buffer_size: 16GB
+  protocol: rdma # Change to the correct transport for your fabric.
+  enable_gpu_direct: false
+  device_name: mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11 # Set to the real RDMA NICs.
+  # protocol: tcp # Switch to TCP if RDMA is not available.
+
+output_dir: ./outputs/train_kimi_k3_3node_b200
+cache_dir: ./cache/train_kimi_k3_3node_b200
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+
+logging:
+  report_to: none
+  wandb_key: null
+  wandb_project: train_kimi_k3
+  wandb_team: null
+  wandb_group: null
+  wandb_mode: online
+  wandb_random_suffix: true
