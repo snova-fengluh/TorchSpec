@@ -20,6 +20,9 @@
 #   RAY_PORT            — Ray GCS port (default: 6380)
 #   NCCL_SOCKET_IFNAME  — network interface for NCCL/Gloo/TP (default: eth0).
 #                         Find yours with: ip -o -4 addr
+#   MOONCAKE_CUDART_DIR — dir containing libcudart.so.12 for the mooncake_master
+#                         binary. Auto-detected from the venv's pip CUDA runtime
+#                         (nvidia.cuda_runtime) if unset. See Error 6 in SETUP_GUIDE.md.
 
 set -euo pipefail
 set -x
@@ -30,6 +33,23 @@ export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-eth0}
 export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}
 export TP_SOCKET_IFNAME=${TP_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+
+# The mooncake_master binary links against libcudart.so.12 (CUDA 12 ABI). On
+# nodes whose system CUDA is 13.x (only libcudart.so.13 present) it exits 127
+# with "error while loading shared libraries: libcudart.so.12" — see Error 6 in
+# SETUP_GUIDE.md. The CUDA-12 runtime ships inside the venv's pip package. It
+# must be on LD_LIBRARY_PATH BEFORE `ray start` so the raylet — and the
+# mooncake_master Ray actor it spawns — inherit it (LD_LIBRARY_PATH is NOT
+# forwarded via runtime_env, so exporting it only in run.sh does not work).
+MOONCAKE_CUDART_DIR="${MOONCAKE_CUDART_DIR:-$(python3 -c "import os, nvidia.cuda_runtime as m; print(os.path.join(os.path.dirname(m.__file__), 'lib'))" 2>/dev/null || true)}"
+if [[ -n "$MOONCAKE_CUDART_DIR" && -e "$MOONCAKE_CUDART_DIR/libcudart.so.12" ]]; then
+  export LD_LIBRARY_PATH="$MOONCAKE_CUDART_DIR:${LD_LIBRARY_PATH:-}"
+  echo "Prepended libcudart.so.12 dir to LD_LIBRARY_PATH: $MOONCAKE_CUDART_DIR"
+else
+  echo "WARNING: libcudart.so.12 not found (looked in '${MOONCAKE_CUDART_DIR:-<empty>}')."
+  echo "         mooncake_master may fail with exit code 127 — set MOONCAKE_CUDART_DIR"
+  echo "         to the dir containing libcudart.so.12. See Error 6 in SETUP_GUIDE.md."
+fi
 
 NODE_ROLE="${NODE_ROLE:?NODE_ROLE must be set to head or worker}"
 RAY_PORT="${RAY_PORT:-6380}"

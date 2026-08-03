@@ -81,6 +81,7 @@ fi
 echo "=== Launching training ==="
 # Topology (nnodes=2, tp_size=16, aux layers, MXFP4 auto-detect) is already
 # encoded in the YAML; we only surface the GPU/node counts as overridable knobs.
+export RAY_ADDRESS=10.1.33.25:6380  
 python3 -m torchspec.train_entry \
   --config "$CONFIG_FILE" \
   training.training_num_gpus_per_node="$TRAIN_GPUS" \

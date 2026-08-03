@@ -27,7 +27,7 @@
 # BEFORE RUNNING, resolve the remaining BLOCKER flagged below (engine support).
 
 model:
-  target_model_path: moonshotai/Kimi-K3
+  target_model_path: /sms-scratch/vamsik/checkpoints/Kimi-K3
   trust_remote_code: true                 # custom KimiK3/KimiLinear modeling code
   draft_model_config: configs/draft_models/kimi_k3_eagle3_mla.json
   # Weight keys VERIFIED against K3's model.safetensors.index.json: the text tower
@@ -91,7 +91,7 @@ inference:
     # Native MXFP4 weights (~1.45 TB) across 16 B200 leaves headroom; raise
     # cautiously. Re-verify the exact on-GPU size for your build.
     mem_fraction_static: 0.85
-    enable_multimodal: true
+    enable_multimodal: false
     init_timeout: 1800
     dist_timeout: 600
     extra_args:
@@ -119,7 +119,7 @@ mooncake:
   local_buffer_size: 16GB
   protocol: rdma # Change to the correct transport for your fabric.
   enable_gpu_direct: false
-  device_name: mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11 # Set to the real RDMA NICs.
+  device_name: mlx5_2,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9 # Set to the real RDMA NICs.
   # protocol: tcp # Switch to TCP if RDMA is not available.
 
 output_dir: ./outputs/train_kimi_k3_3node_b200
@@ -133,7 +133,7 @@ logging:
   report_to: none
   wandb_key: null
   wandb_project: train_kimi_k3
-  wandb_team: null
-  wandb_group: null
+  wandb_team: ravi-raju0594-personal
+  wandb_group: kimi_k3_eagle3
   wandb_mode: online
   wandb_random_suffix: true
