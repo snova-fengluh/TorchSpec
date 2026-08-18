@@ -5,63 +5,72 @@ Production 3-node setup for training an Eagle3 draft model for **Kimi-K3**
 KDA/MLA hybrid text tower. The shipped checkpoint is already MXFP4-packed; vLLM
 auto-detects the compressed-tensors format from the checkpoint.
 
+The cluster/env plumbing reuses the verified
+[`kimi-k3-2node-inference-b200`](../kimi-k3-2node-inference-b200) recipe
+(shared `ray_env.sh` sourced before `ray start`, NCCL over TCP on the control
+NIC, `VLLM_USE_DEEP_GEMM=0`, default `/tmp/ray` temp dir so `RAY_ADDRESS=auto`
+works), plus the training-only pieces: Mooncake hidden-state transfer and
+IP-pinned node roles.
+
+> **Bring-up status & debugging record:** see [KNOWN_ISSUES.md](KNOWN_ISSUES.md)
+> for every issue hit so far (root causes + fixes), what remains unverified,
+> and the ranked structural fixes for a smooth training run.
+
+## Node layout
+
+Roles are pinned by IP via `training.placement_strategy=custom` — they do
+**not** depend on Ray join order:
+
+| Node | Role | GPUs |
+|------|------|------|
+| `10.1.33.20` | vLLM inference, node_rank 0 (TP dist-init master) | 8 |
+| `10.1.33.22` | vLLM inference, node_rank 1 | 8 |
+| `10.1.33.24` | Ray head + FSDP draft training | 8 |
+
+The two inference nodes form one TP=16 vLLM engine (TorchSpec's multi-node
+vLLM path computes `tp_size = nnodes × gpus_per_node`; there is no PP option
+here, unlike the standalone 2-node inference example). Cross-node NCCL runs
+over TCP on the control NIC; hidden states flow to the training node via
+Mooncake (TCP by default).
+
 ## Prerequisites
 
-- 3 nodes with 24 GPUs total (8x B200 each):
-  - Node 0 (head): 8 GPUs (GPU 0-7) for FSDP draft training
-  - Node 1-2 (workers): 8 GPUs each for vLLM inference (TP=16, `nnodes=2`)
-- Model access to `moonshotai/Kimi-K3` (`trust_remote_code=true`)
-- RDMA network for Mooncake hidden-state transfer (or fall back to TCP)
-
-## Config
-
-Uses [`configs/vllm_kimi_k3_3node.yaml`](../../configs/vllm_kimi_k3_3node.yaml)
-with draft model config
-[`configs/draft_models/kimi_k3_eagle3_mla.json`](../../configs/draft_models/kimi_k3_eagle3_mla.json).
-
-The YAML already encodes the full topology (`vllm.nnodes=2`, `tp_size=16`,
-`inference_num_gpus=16`, `training_num_gpus_per_node=8`) and the aux hidden-state
-layers `[4, 48, 88]` (all full-attention/MLA layers). Ray auto-negotiates the
-addresses left `null` (`vllm.dist_init_addr`, `mooncake.master_server_address`,
-`mooncake.metadata_server`, and the training `MASTER_ADDR`).
-
-## Before you run — fill these in
-
-1. **Network interface.** The scripts default to `eth0`. Find yours with
-   `ip -o -4 addr` and export it consistently on every node:
-   ```bash
-   export NCCL_SOCKET_IFNAME=<iface>   # e.g. bond0, ens0
-   ```
-
-2. **RDMA NIC names.** The YAML ships with placeholder `mooncake.device_name`
-   (`mlx5_7,...`). Get the real device names with `ibdev2netdev -v` and pass them
-   via `MOONCAKE_DEVICE_NAME` (see below), or edit the YAML. **No RDMA?** Set
-   `MOONCAKE_PROTOCOL=tcp`.
-
-3. **Model weights.** Ensure `moonshotai/Kimi-K3` is accessible (HF token or
-   pre-downloaded, ~1.45 TB MXFP4 on disk).
+- The three nodes above, 8× B200 each, sharing the `10.1.33.0/24` control
+  subnet (auto-detected in `ray_env.sh`; override `SUBNET_PREFIX`/`NET_IF_CTRL`).
+- **Python env: the repo `venv`** (default in `ray_env.sh`). It has torchspec
+  (editable), `mooncake-transfer-engine`, and vLLM nightly with
+  `KimiK3ForConditionalGeneration`. The shared `vllm_kimi_k3` conda env used by
+  the 2-node inference example is *not* sufficient — it lacks
+  omegaconf/mooncake. Because the venv lives on shared scratch, all nodes get
+  identical python/torch/NCCL automatically.
+- Model weights at `/sms-scratch/vamsik/checkpoints/Kimi-K3` (~1.45 TB MXFP4,
+  `trust_remote_code=true`). First load from cold NFS takes hours; page-cached
+  reruns take minutes.
+- A training dataset **with completions** — see [Dataset](#dataset) below.
+- Note: these are the same GPUs the 2-node inference example uses —
+  `setup_ray_cluster.sh` tears down any existing Ray cluster on each node.
 
 ## How to run
 
 ### 1. Start the Ray cluster
 
-On the **head node** (node 0):
+On the **training node** (`10.1.33.24`):
 
 ```bash
-NCCL_SOCKET_IFNAME=<iface> NODE_ROLE=head \
+NODE_ROLE=head bash examples/kimi-k3-3node-b200/setup_ray_cluster.sh
+```
+
+On **each inference node** (`10.1.33.20`, then `10.1.33.22`):
+
+```bash
+NODE_ROLE=worker HEAD_IP=10.1.33.24 \
   bash examples/kimi-k3-3node-b200/setup_ray_cluster.sh
 ```
 
-It prints its `LOCAL_IP` — use that as `<node0_ip>` below.
+Each node prints a preflight block (python/ray paths, torch/NCCL/CUDA/vLLM
+versions, mooncake import) — the blocks must match line-for-line across nodes.
 
-On each **worker node** (nodes 1-2):
-
-```bash
-NCCL_SOCKET_IFNAME=<iface> HEAD_IP=<node0_ip> NODE_ROLE=worker \
-  bash examples/kimi-k3-3node-b200/setup_ray_cluster.sh
-```
-
-Verify from the head node that all 24 GPUs joined:
+Verify from the head node:
 
 ```bash
 ray status    # expect 3 nodes / 24 GPUs
@@ -69,40 +78,108 @@ ray status    # expect 3 nodes / 24 GPUs
 
 ### 2. Launch training
 
-On the **head node**:
+On the **training node** (`10.1.33.24`):
 
 ```bash
-NCCL_SOCKET_IFNAME=<iface> MOONCAKE_DEVICE_NAME=<mlx5_...> \
+DATA_PATH=/path/to/train_conversations.jsonl \
   bash examples/kimi-k3-3node-b200/run.sh
+```
+
+## Dataset
+
+**The data file needs both the prompt *and* the completion.** Training never
+generates text: the target model runs a *prefill-only* forward pass
+(`max_tokens=1`) over each full conversation to extract aux hidden states, and
+the draft is trained on the assistant spans via the loss mask. Conversations
+whose assistant spans are empty are dropped during preprocessing. (The vLLM
+backend also doesn't support `train_with_decode`, so there is no
+generate-during-training fallback.)
+
+Format — one JSON object per line, assistant turns present:
+
+```json
+{"id": "...", "conversations": [
+  {"role": "user", "content": "..."},
+  {"role": "assistant", "reasoning_content": "...", "content": "..."}]}
+```
+
+For the `kimi-k3` chat template, assistant reasoning goes in
+`reasoning_content` (or an inline `<think>...</think>` block in `content`);
+the parser renders it into K3's native think/response channels.
+
+Any assistant text works mechanically (the target model is teacher-forced over
+it), but **Kimi-K3's own completions are the right choice** — the draft should
+learn the distribution it will speculate for, including the `<think>` channel.
+Generate them with the 2-node inference example, then convert:
+
+```bash
+# 1) On the 2-node inference cluster: prompts -> K3 completions
+DATA_PATH=examples/data/sample_conversations.jsonl \
+  bash examples/kimi-k3-2node-inference-b200/run.sh
+
+# 2) Convert completions JSONL -> training conversations JSONL
+python examples/kimi-k3-3node-b200/completions_to_train_data.py \
+  --input outputs/kimi_k3_2node_inference/completions_<ts>.jsonl \
+  --output examples/data/kimi_k3_train_conversations.jsonl
+```
+
+The converter splits each raw completion at the K3 channel markers into
+`reasoning_content` / `content` and drops truncated (`finish_reason != stop`)
+completions by default.
+
+## Common customizations
+
+```bash
+# Different node assignment (first inference IP becomes vLLM node_rank 0)
+TRAIN_NODE_IP=10.1.33.24 INFER_NODE_IPS=10.1.33.20,10.1.33.22 \
+  bash examples/kimi-k3-3node-b200/run.sh
+
+# RDMA transport for Mooncake (only with a verified shared fabric!)
+MOONCAKE_PROTOCOL=rdma MOONCAKE_DEVICE_NAME=mlx5_2,mlx5_5 \
+  bash examples/kimi-k3-3node-b200/run.sh
+
+# Degraded node: register fewer GPUs on the affected node, keep counts in sync
+#   On that node:  NUM_GPUS=6 NODE_ROLE=... bash .../setup_ray_cluster.sh
+#   On the head:   INFERENCE_GPUS=12 bash .../run.sh   # TP must divide 96
+
+# Extra config overrides pass through to train_entry
+bash examples/kimi-k3-3node-b200/run.sh training.learning_rate=1e-5
 ```
 
 ## Scripts
 
 | Script | Purpose |
 |--------|---------|
-| `setup_ray_cluster.sh` | Start Ray head/worker nodes |
-| `run.sh` | Launch training (run on head node after the cluster is ready) |
+| `ray_env.sh` | Shared env (venv activate, NIC/NCCL config, vLLM knobs, Mooncake cudart) — sourced by both scripts, on all nodes |
+| `setup_ray_cluster.sh` | Preflight + clean stale state + start Ray head/worker |
+| `run.sh` | Launch training with IP-pinned roles (run on the training node) |
+| `completions_to_train_data.py` | Convert 2-node inference completions into training conversations |
 
-## Common customizations
+## Notes
 
-```bash
-# No RDMA fabric — use TCP transport
-MOONCAKE_PROTOCOL=tcp bash examples/kimi-k3-3node-b200/run.sh
-
-# Override config file
-CONFIG_FILE=path/to/custom.yaml bash examples/kimi-k3-3node-b200/run.sh
-
-# Pass extra config overrides through to train_entry
-bash examples/kimi-k3-3node-b200/run.sh training.learning_rate=1e-5
-```
-
-## Caveats — verify before a full run
-
-- **Engine support (BLOCKER).** TorchSpec's `VllmEngine` +
+- **`RAY_ADDRESS=auto` is required** and set by `run.sh`; discovery reads
+  `/tmp/ray/session_latest`, which is why `setup_ray_cluster.sh` uses Ray's
+  default temp dir (the old custom `--temp-dir` broke discovery and made
+  vLLM's EngineCore start a local single-node Ray instance).
+- **`ray_env.sh` must be sourced before `ray start`** — the raylet snapshots
+  its environment (NCCL socket config, `VLLM_USE_DEEP_GEMM=0`, Mooncake's
+  `libcudart.so.12` on `LD_LIBRARY_PATH`) and hands it to every actor.
+- **Engine support (BLOCKER, unverified).** TorchSpec's `VllmEngine` +
   `MooncakeHiddenStatesConnector` path is unverified for the custom
-  `KimiK3ForConditionalGeneration` (KDA/MLA hybrid) aux hidden-state extraction.
-  Smoke-test that vLLM loads the model and extracts aux hidden states before
-  committing to the full `num_epochs=3` run.
-- **Memory footprint.** The 2-node (TP=16) inference layout assumes the native
-  MXFP4 target fits with KV/activation headroom at `mem_fraction_static=0.85`.
-  Re-verify the on-GPU size for your build before assuming 2 nodes suffice.
+  `KimiK3ForConditionalGeneration` (KDA/MLA hybrid) aux hidden-state
+  extraction. Smoke-test with a handful of samples
+  (`training.num_train_steps=3`) before committing to the full run.
+- **Memory footprint.** TP=16 across 2 nodes assumes the native MXFP4 target
+  fits with KV/activation headroom at `mem_fraction_static=0.85`; re-verify
+  for your build.
+- **Cross-node TP over TCP is slow.** The 2-node inference example gets away
+  with TCP because its TP=8×PP=2 layout keeps TP all-reduces on NVLink; this
+  training path has no PP option, so every layer's TP all-reduce crosses the
+  TCP link (measured ~1.8 Gb/s on this cluster) — expect very slow prefill.
+  Correctness first; for throughput, validate a rail-pinned RoCE
+  `NCCL_IB_HCA` pairing for `10.1.33.20↔10.1.33.22` (the system-order-LCS
+  procedure that hit ~60 GB/s on other node pairs; note .22's rail 43 /
+  `mlx5_13` is dead) and relax the `NCCL_NET=Socket` block in `ray_env.sh`.
+  That path also needs the raylet memlock fix
+  (`sudo prlimit --memlock=unlimited:unlimited --pid $(pgrep -x raylet)`
+  after every `ray start`).

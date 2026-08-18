@@ -36,7 +36,7 @@ from torchspec.controller.eval import (
     setup_eval,
     update_checkpoint_eval_meta,
 )
-from torchspec.utils.logging import get_tb_writer, logger
+from torchspec.utils.logging import close_tb_writer, get_tb_writer, logger
 
 
 def _maybe_sync_draft_weights(args, completed_steps, train_group, inference_engines):
@@ -483,3 +483,9 @@ def run_training_loop(
             inference_future=inference_future,
             inference_engines=inference_engines,
         )
+        if getattr(wandb, "run", None) is not None:
+            try:
+                wandb.finish()
+            except Exception as exc:
+                logger.warning(f"wandb.finish failed: {exc}")
+        close_tb_writer()

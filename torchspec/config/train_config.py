@@ -87,6 +87,13 @@ class ModelConfig:
     norm_key: str = "model.norm.weight"
     target_model_backend: str = "sglang"
     target_model_path: str = ""
+    # Optional target-checkpoint path used ONLY by the inference engines, for
+    # when the checkpoint is staged on node-local storage of the inference
+    # nodes (e.g. /dev/shm). The driver and training actors (tokenizer,
+    # embed/lm_head/norm loading, draft-config generation) keep reading from
+    # target_model_path, which must be reachable from the training node.
+    # Defaults to target_model_path when unset.
+    inference_model_path: Optional[str] = None
     trust_remote_code: bool = False
 
 

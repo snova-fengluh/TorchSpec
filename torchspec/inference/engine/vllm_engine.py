@@ -42,6 +42,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.ray.ray_actor import RayActor
+from torchspec.utils.env import resolve_local_socket_ifnames
 from torchspec.utils.logging import logger, setup_file_logging
 from torchspec.utils.misc import get_default_eagle3_aux_layer_ids
 
@@ -95,6 +96,11 @@ class VllmEngine(InferenceEngine, RayActor):
         dist_init_addr: str | None = None,
         pre_allocated_port: int | None = None,
     ) -> None:
+        # The driver-forwarded *_SOCKET_IFNAME values may be wrong for THIS
+        # node (NIC names differ across nodes); re-resolve locally before any
+        # NCCL/Gloo group is created.
+        resolve_local_socket_ifnames()
+
         if self.base_gpu_id is not None:
             self.local_gpu_id = self.setup_gpu(self.base_gpu_id)
             logger.info(
@@ -317,6 +323,29 @@ class VllmEngine(InferenceEngine, RayActor):
             # allocations (extracting hidden states from KV cache during
             # save_kv_layer).  Auto-compute a utilization that reserves room.
             engine_kwargs["gpu_memory_utilization"] = self._compute_mem_fraction(engine_kwargs)
+
+        if nnodes > 1 and self.node_rank > 0:
+            # Follower nodes must NOT build a full LLM engine: the leader's
+            # EngineCore drives everything via collective_rpc, which asserts
+            # on followers ("collective_rpc should not be called on follower
+            # node"). Mirror `vllm serve --headless` for multi-node TP
+            # (entrypoints/cli/serve.py run_headless): build the config and
+            # run ONLY the MultiprocExecutor — its workers join the leader's
+            # rpc broadcast queue via master_addr and are driven remotely.
+            from vllm.engine.arg_utils import EngineArgs
+            from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+            vllm_config = EngineArgs(**engine_kwargs).create_engine_config(headless=True)
+            self._engine = None
+            self._worker_executor = MultiprocExecutor(vllm_config, monitor_workers=False)
+            # Non-inline: spawns a daemon monitor thread so the Ray actor
+            # stays responsive while the workers serve the leader.
+            self._worker_executor.start_worker_monitor()
+            logger.info(
+                f"VllmEngine rank {self.rank}: headless follower executor started "
+                f"(node_rank={self.node_rank}, leader={dist_init_addr})"
+            )
+            return
 
         self._engine = LLM(**engine_kwargs)
         logger.info(

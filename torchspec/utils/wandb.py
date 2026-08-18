@@ -58,7 +58,13 @@ def init_wandb_primary(args):
 
     # Only perform explicit login when NOT offline
     if (not offline) and args.wandb_key is not None:
-        wandb.login(key=args.wandb_key, host=args.wandb_host)
+        try:
+            wandb.login(key=args.wandb_key, host=args.wandb_host)
+        except Exception as exc:
+            logger.warning(f"W&B login failed, disabling W&B logging: {exc}")
+            args.use_wandb = False
+            args.wandb_run_id = None
+            return
 
     # Prepare wandb init parameters
     # add random 6 length string with characters
@@ -92,7 +98,15 @@ def init_wandb_primary(args):
         init_kwargs["dir"] = args.wandb_dir
         logger.info(f"W&B logs will be stored in: {args.wandb_dir}")
 
-    wandb.init(**init_kwargs)
+    try:
+        wandb.init(**init_kwargs)
+    except Exception as exc:
+        # A W&B outage or a misconfigured entity/project must not kill a
+        # multi-node training run — degrade to local-only logging instead.
+        logger.warning(f"wandb.init failed, disabling W&B logging: {exc}")
+        args.use_wandb = False
+        args.wandb_run_id = None
+        return
 
     _init_wandb_common()
 

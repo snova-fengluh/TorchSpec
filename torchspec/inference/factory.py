@@ -20,6 +20,8 @@
 
 """Inference engine creation and initialization with Ray placement groups."""
 
+import copy
+
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
@@ -29,6 +31,27 @@ from torchspec.utils.logging import logger
 # Multi-node TP worker engines must stay alive to participate in NCCL
 # operations but are never called directly. Store refs here to prevent GC.
 _alive_worker_engines: list = []
+
+
+def _resolve_engine_args(args):
+    """Swap in ``inference_model_path`` for the engines' view of the target.
+
+    The checkpoint may be staged on node-local storage of the inference nodes
+    (e.g. /dev/shm) under a different path than the shared-filesystem copy the
+    driver/trainer read. Engine actors resolve every target-model access
+    (weights, AutoConfig, aux-layer defaults) through args.target_model_path,
+    so hand them a shallow copy with that field pointing at the staged path.
+    """
+    inference_path = getattr(args, "inference_model_path", None)
+    if not inference_path or inference_path == args.target_model_path:
+        return args
+    engine_args = copy.copy(args)
+    engine_args.target_model_path = inference_path
+    logger.info(
+        f"Inference engines will load the target model from {inference_path} "
+        f"(driver/trainer keep {args.target_model_path})"
+    )
+    return engine_args
 
 
 def create_inference_engines(args, inference_pg, mooncake_config, engine_group: int = 0):
@@ -49,6 +72,7 @@ def create_inference_engines(args, inference_pg, mooncake_config, engine_group: 
     if engine_type not in ("hf", "sgl", "vllm", "trtllm"):
         raise ValueError(f"Unknown inference_engine_type: {engine_type}")
 
+    args = _resolve_engine_args(args)
     logger.info(f"Using {engine_type} engine for inference")
 
     engines = init_engines(
@@ -83,6 +107,7 @@ def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group:
     if engine_type not in ("hf", "sgl", "vllm", "trtllm"):
         raise ValueError(f"Unknown inference_engine_type: {engine_type}")
 
+    args = _resolve_engine_args(args)
     logger.info(f"Preparing {engine_type} inference engines...")
 
     if engine_type == "hf":
@@ -405,9 +430,11 @@ def _prepare_vllm_engines(
     pre_allocated_ports: dict[int, int] = {}
     next_start = 10000
     for i in range(num_engines):
+        # Generous timeout: this is the first RPC to the actor, so it also waits
+        # for actor scheduling + worker process spawn + vLLM import (slow on NFS).
         port = ray.get(
             engines[i].find_free_port.remote(start_port=next_start, consecutive=2),
-            timeout=30,
+            timeout=300,
         )
         pre_allocated_ports[i] = port
         next_start = port + 2
@@ -425,7 +452,7 @@ def _prepare_vllm_engines(
             else:
                 head_idx = replica_idx * nnodes
                 head_engine = engines[head_idx]
-                ip = ray.get(head_engine.get_node_ip.remote(), timeout=30)
+                ip = ray.get(head_engine.get_node_ip.remote(), timeout=300)
                 addr = f"{ip}:{pre_allocated_ports[head_idx]}"
                 dist_init_addrs[replica_idx] = addr
                 logger.info(

@@ -30,6 +30,7 @@ from torchspec.models.draft.dspark import DSparkConfig
 from torchspec.ray.ray_actor import RayActor
 from torchspec.training.eagle3_trainer import Eagle3Trainer
 from torchspec.utils.distributed import init_gloo_group, init_usp_groups
+from torchspec.utils.env import resolve_local_socket_ifnames
 from torchspec.utils.logging import setup_file_logging
 
 
@@ -50,6 +51,11 @@ class TrainerActor(RayActor):
 
     def init(self, args: Namespace, role: str, mooncake_config=None, with_ref: bool = False) -> int:
         self.args = args
+
+        # The driver-forwarded *_SOCKET_IFNAME values may be wrong for THIS
+        # node (NIC names differ across nodes); re-resolve locally before any
+        # NCCL/Gloo group is created.
+        resolve_local_socket_ifnames()
 
         backend = getattr(args, "distributed_backend", "nccl")
         if getattr(args, "fsdp_cpu_offload", False) and getattr(args, "fsdp_cpu_backend", None):

@@ -27,7 +27,14 @@
 # BEFORE RUNNING, resolve the remaining BLOCKER flagged below (engine support).
 
 model:
+  # Read by the DRIVER and TRAINING actors (tokenizer, embed/lm_head/norm
+  # weights, draft-config generation) — must be reachable from the training
+  # node, so keep it on the shared filesystem.
   target_model_path: /sms-scratch/vamsik/checkpoints/Kimi-K3
+  # Read ONLY by the inference engines. /dev/shm is NODE-LOCAL: the full
+  # checkpoint (~1.45 TB) must be staged at this path on EVERY inference node
+  # before launching. Unset (null) to load from target_model_path instead.
+  inference_model_path: /dev/shm/Kimi-K3
   trust_remote_code: true                 # custom KimiK3/KimiLinear modeling code
   draft_model_config: configs/draft_models/kimi_k3_eagle3_mla.json
   # Weight keys VERIFIED against K3's model.safetensors.index.json: the text tower
@@ -105,6 +112,12 @@ inference:
       # is no separate 8-bit->MXFP4 requantization step.
       max_model_len: 20000
       trust_remote_code: true
+      # Text-only training: disable image inputs so vLLM skips the expensive
+      # vision-encoder memory profile (max-size dummy image through the vision
+      # tower) and doesn't reserve encoder-cache memory that would otherwise
+      # eat into the KV budget. Matches the verified 2-node inference config.
+      limit_mm_per_prompt:
+        image: 0
       # BLOCKER 5 (engine support): verify TorchSpec's VllmEngine +
       # extract_hidden_states / MooncakeHiddenStatesConnector can load the custom
       # KimiK3ForConditionalGeneration and extract aux hidden states from the
@@ -130,10 +143,13 @@ debug:
   save_debug_train_data: null
 
 logging:
-  report_to: none
+  report_to: wandb
+  # Credentials come from `wandb login` (~/.netrc) or WANDB_API_KEY on the
+  # driver (Ray head) node; wandb_key is only needed when neither is set.
   wandb_key: null
-  wandb_project: train_kimi_k3
+  # null → the logged-in account's default entity. Set explicitly to log to a
+  # shared team instead.
   wandb_team: ravi-raju0594-personal
-  wandb_group: kimi_k3_eagle3
+  wandb_project: kimi_k3_eagle3
   wandb_mode: online
   wandb_random_suffix: true
